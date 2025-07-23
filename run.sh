@@ -1,10 +1,9 @@
 python dbf_ptq.py \
     --gpu 0 \
     --target_bit 1.5 \
-    --model_name "llama2_7b" \
+    --model_name "meta-llama/Llama-2-7b-hf" \
     --n_calib_data 256 \
-    --n_epochs 8 \
+    --n_epochs 4 \
     --lr 0.00003 \
-    --eval \
-    --save_dir /mnt/disk2-part1/mingchuan/double_binary/raw_stuff/results/ptq_experiments/debug \
+    --save_dir /projects/p487-24-1/dbf_rep \
     --is_save_ckpt \

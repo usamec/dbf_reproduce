@@ -58,12 +58,12 @@ import torch
 import torch.nn as nn
 from transformers import AutoTokenizer
 import sys
-sys.path.append("/mnt/disk2-part1/mingchuan/motlibs")
-from apps.llm.finetuning.utils.data import HuggingFaceDataloader
+#sys.path.append("/mnt/disk2-part1/mingchuan/motlibs")
+#from apps.llm.finetuning.utils.data import HuggingFaceDataloader
 from dbf_utils import get_opt, collect_norms, opt_sequential, eval_model, BitLinear
 
-model = get_opt(args.model_path)
-tokenizer_path = args.model_path
+model = get_opt(args.model_name)
+tokenizer_path = args.model_name
 tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
 
 print("total params: ", sum(p.numel() for p in model.parameters()), 
@@ -72,28 +72,48 @@ print(model)
 
 #################### loading dataset
 
-dataloader = HuggingFaceDataloader(
-    name = args.train_dataset,
-    split = "train", 
-    block_size = args.seqlen,
-    shuffle = True,
-    batch_size = 1,
-    use_cache = True,
-)
+#dataloader = HuggingFaceDataloader(
+#    name = args.train_dataset,
+#    split = "train", 
+#    block_size = args.seqlen,
+#    shuffle = True,
+#    batch_size = 1,
+#    use_cache = True,
+#)
 
-dataloader.configure(datapath=args.data_path , model_name=args.model_name, tokenizer=tokenizer)
-dataloader = dataloader.get_dataloader()
+#dataloader.configure(datapath=args.data_path , model_name=args.model_name, tokenizer=tokenizer)
+#dataloader = dataloader.get_dataloader()
 
-eval_dataloader = HuggingFaceDataloader(
-    name = "wikitext",
-    split = "test", 
-    block_size = args.seqlen,
-    shuffle = False,
-    batch_size = 1,
-    use_cache = True,
+#eval_dataloader = HuggingFaceDataloader(
+#    name = "wikitext",
+#    split = "test", 
+#    block_size = args.seqlen,
+#    shuffle = False,
+#    batch_size = 1,
+#    use_cache = True,
+#)
+#eval_dataloader.configure(datapath=args.data_path , model_name=args.model_name, tokenizer=tokenizer)
+#eval_dataloader = eval_dataloader.get_dataloader()
+
+
+
+n_samples = 256
+import datasets
+import numpy as np
+ds = datasets.load_from_disk("/projects/p487-24-1/redpajama_tokenized_llama2/")
+
+np.random.seed(47)
+inds = np.random.randint(0, len(ds), size=n_samples)
+
+dataloader = torch.LongTensor(ds[inds]["input_ids"])
+dataloader.shape
+
+import datautils
+_, eval_dataloader = datautils.get_loaders(
+    "wikitext2", seed=0, model=args.model_name, seqlen=model.seqlen
 )
-eval_dataloader.configure(datapath=args.data_path , model_name=args.model_name, tokenizer=tokenizer)
-eval_dataloader = eval_dataloader.get_dataloader()
+print("eval_loader", eval_dataloader.input_ids.shape)
+
 
 ##################### collecting norms 
 
@@ -109,27 +129,28 @@ for n, m in model.named_modules():
         break
 
 ##########################  PTQ process
-start = time.time()
-opt_sequential(model, dataloader, dev="cuda", 
-                target_bits=args.target_bits, 
-                n_samples=args.n_calib_data, 
-                norm_order=args.norm_order,
-                n_epochs=args.n_epochs, 
-                lr=args.lr, 
-                weight_decay=args.weight_decay, 
-                n_grad_accumu=args.n_grad_accumu,
-                one_cycle_lr=args.one_cycle_lr,
-                admm_reg=args.admm_reg,
-                outer_iters=args.alter_opt_outer_iters,
-                inner_iters=args.alter_opt_inner_iters,
-                save_dir=args.save_dir,
-                only_full_ft=args.only_full_ft,
-                train_scaling_vectors=args.train_scaling_vectors,
-                lr_s=args.lr_s,
-                epoch_s=args.epoch_s,
-                test_dataloader=eval_dataloader if args.eval else None,
-               )
-print("total time", time.time() - start)
+if True:
+    start = time.time()
+    opt_sequential(model, dataloader, dev="cuda", 
+                    target_bits=args.target_bits, 
+                    n_samples=args.n_calib_data, 
+                    norm_order=args.norm_order,
+                    n_epochs=args.n_epochs, 
+                    lr=args.lr, 
+                    weight_decay=args.weight_decay, 
+                    n_grad_accumu=args.n_grad_accumu,
+                    one_cycle_lr=args.one_cycle_lr,
+                    admm_reg=args.admm_reg,
+                    outer_iters=args.alter_opt_outer_iters,
+                    inner_iters=args.alter_opt_inner_iters,
+                    save_dir=args.save_dir,
+                    only_full_ft=args.only_full_ft,
+                    train_scaling_vectors=args.train_scaling_vectors,
+                    lr_s=args.lr_s,
+                    epoch_s=args.epoch_s,
+                    test_dataloader=eval_dataloader if args.eval else None,
+                   )
+    print("total time", time.time() - start)
 
 if args.is_save_ckpt:
     print("saving model...")
@@ -143,9 +164,11 @@ if args.is_save_ckpt:
 
 ########################## PPL testing and dump results 
 print("Testing PPL...")
+torch.cuda.empty_cache()
 model.cuda()
 model.gradient_checkpointing_disable()
 ppl = eval_model(model, eval_dataloader)
+print("Got PPL", ppl)
 # os.makedirs(args.save_dir, exist_ok=True)
 with open(os.path.join(args.save_dir, "test_results.json"), "w") as f:
     json.dump({"eval_perplexity": ppl, "seq_len": model.seqlen}, f)

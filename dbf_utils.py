@@ -10,9 +10,10 @@ from transformers import AutoModelForCausalLM, AutoConfig
 import json
 import os
 
+from bf16_fused_adam import BF16FusedAdamW
 from torch.utils.tensorboard import SummaryWriter
 
-def get_opt(model):
+def get_opt_bad(model):
     def skip(*args, **kwargs):
         pass
     torch.nn.init.kaiming_uniform_ = skip
@@ -30,6 +31,21 @@ def get_opt(model):
     model.seqlen = model.config.max_position_embeddings
     print("seqlen: ", model.seqlen)
     return model
+
+def get_opt(model):
+    import torch
+    def skip(*args, **kwargs):
+        pass
+    torch.nn.init.kaiming_uniform_ = skip
+    torch.nn.init.uniform_ = skip
+    torch.nn.init.normal_ = skip
+    from transformers import AutoModelForCausalLM
+    model = AutoModelForCausalLM.from_pretrained(model, torch_dtype=torch.bfloat16, attn_implementation = "flash_attention_2")
+    print("ms", model.config.max_position_embeddings)
+    model.seqlen = model.config.max_position_embeddings
+    return model
+
+
 
 def power_iteration(A, num_iters=5):
     """
@@ -186,6 +202,8 @@ def factorizeT(W, XX, o_norm, outer_iters, inner_iters, admm_reg, target_bits):
                       reg=admm_reg,
                       iters=inner_iters,
                       rho_start=rho_start)
+        if itt == outer_iters - 1:
+            print("err", itt, ((Az / mid).matmul(Bz) - Wn).square().sum().item(), (Wn).square().sum().item())
 
     # print(f"relative err percent of iter {itt}: ", ((Az / mid).matmul(Bz) - Wn).square().sum().item() / (Wn).square().sum().item())
             
@@ -252,6 +270,8 @@ def factorizef(W, XX, o_norm, outer_iters, inner_iters, admm_reg, target_bits):
                       reg=admm_reg,
                       iters=inner_iters,
                       rho_start=rho_start)
+        if itt == outer_iters - 1:
+            print("err", itt, ((Az / mid).matmul(Bz) - Wn).square().sum().item(), (Wn).square().sum().item())
 
     # the reconstructed matrix is (Az / mid).matmul(Bz)
     # because the Bz is opted asssuming Az was normalized at the last iteration
@@ -305,12 +325,15 @@ class BitLinear(nn.Module):
 
         self.shape = b.shape
         self.register_buffer("bp", b)
+        self.packed = False
     
     def pack_to_save(self):
         self.bp = my_pack(self.bp.flatten())
+        self.packed = True
     
     def forward(self, x):
-        # return x.matmul(my_unpack(self.bp).reshape(self.shape).T.to(x.dtype))
+        if self.packed:
+            return x.matmul(my_unpack(self.bp).reshape(self.shape).T.to(x.dtype))
         return x.matmul(self.bp.reshape(self.shape).T.to(x.dtype))
 
         
@@ -379,7 +402,7 @@ def collect_norms(model, dataloader, n_calib_data=256, n_calib_limit=256, seqlen
     print("Collecting i_norm and o_norm for linear layers...")
     for n, m in model.named_modules():
         if type(m) == nn.Linear and "lm_head" not in n:
-            print(n)
+            #print(n)
             m.i_norm = torch.zeros(m.weight.shape[1], device=m.weight.device)
             m.o_norm = torch.zeros(m.weight.shape[0], device=m.weight.device)
             handles.append(m.register_forward_hook(f_hook))
@@ -403,13 +426,13 @@ def collect_norms(model, dataloader, n_calib_data=256, n_calib_limit=256, seqlen
         # loss = linear_cross_entropy(embs, model.lm_head.weight, bx, shift=1)
         # print(idx, loss)
         # loss.backward()
-        eval_batch = eval_batch.cuda()
+        eval_batch = eval_batch.cuda().unsqueeze(0)
         lm_logits = model(eval_batch).logits
         shift_logits = lm_logits[:, :-1, :].contiguous()
         shift_labels = eval_batch[:, 1:]
         loss_fct = nn.CrossEntropyLoss()
         loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
-        # print(idx, loss)
+        print(idx, loss)
         loss.backward()
 
     for h in handles:
@@ -527,16 +550,25 @@ def opt_sequential(model, dataloader, dev, target_bits=2.0, n_samples=256, norm_
             else:
                 cond = ("q_proj" in name and i >= 1) or "k_proj" in name
             if len(to_opt) > 0 and cond:
-                
+               
+                err_before = 0
+                for j in range(n_samples):
+                    cur_out = layer(comp_inps[j].unsqueeze(0).cuda(), attention_mask=attention_mask, position_embeddings=position_embeddings)[0]
+                    err_before += ((cur_out.float() - inps[j].cuda().float()).square() * imp).mean().item()
+
+                print("err before", err_before)
+
                 for n, p in to_opt.items():
                     p.requires_grad = True
 
-                print("tuning weights: ", to_opt.keys())
-                opt = torch.optim.AdamW(to_opt.values(), lr, weight_decay=weight_decay)
+                print("tuning weights: ", n_samples, to_opt.keys(), [v.dtype for v in to_opt.values()])
+#                opt = torch.optim.AdamW(to_opt.values(), lr, weight_decay=weight_decay)
+                opt = BF16FusedAdamW(to_opt.values(), lr, weight_decay=weight_decay)
                 if one_cycle_lr:
                     sch = torch.optim.lr_scheduler.OneCycleLR(opt, lr, total_steps=n_samples*n_epochs // n_grad_accumu, cycle_momentum=False)
                 else:
                     sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, n_epochs * n_samples // n_grad_accumu)
+                print("scheduler", sch)
 
                 # start tuning
                 with torch.enable_grad():
@@ -581,8 +613,9 @@ def opt_sequential(model, dataloader, dev, target_bits=2.0, n_samples=256, norm_
                                          outer_iters=outer_iters,
                                          inner_iters=inner_iters)
             W2 = W2.T
-            err_spxsp = (W2.T - lx.weight).square().sum().item() / lx.weight.square().sum().item()
-            print("relative err after factorization: ", err_spxsp, "\n")
+            fact_err = (W2.T - lx.weight).square().sum().item()
+            base_err =  lx.weight.square().sum().item()
+            print("relative err after factorization: ", fact_err/base_err, fact_err, "\n")
             
             # assign compressed matrices to current layer
             lx.weight.data = W2.T.to(lx.weight)
@@ -631,10 +664,13 @@ def opt_sequential(model, dataloader, dev, target_bits=2.0, n_samples=256, norm_
         torch.cuda.empty_cache()
 
 @torch.no_grad()
-def eval_model(model, eval_dataloader):
+def eval_model(model, eval_ids):
+    eval_ids = eval_ids.input_ids.flatten()
+    eval_ids = eval_ids[:len(eval_ids)//model.seqlen*model.seqlen]
+    eval_dataloader = eval_ids.reshape(-1,1,model.seqlen)
     model.eval()
 
-    print("\nStart evaluation...")
+    print("\nStart evaluation...", len(eval_dataloader), len(eval_ids))
     task_loss = 0
     n_processed_seq = 0
     for _, eval_batch in tqdm(enumerate(eval_dataloader), total=len(eval_dataloader)):
