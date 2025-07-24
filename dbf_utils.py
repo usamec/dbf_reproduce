@@ -22,7 +22,7 @@ def get_opt_bad(model):
     
     config = AutoConfig.from_pretrained(model)
     kwargs = {
-            "torch_dtype": torch.bfloat16, # fp32 or bf16, otherwise will be nans
+            "torch_dtype": torch.float32, # fp32 or bf16, otherwise will be nans
             "low_cpu_mem_usage": True,
             "device_map": "balanced",
         }
@@ -40,7 +40,7 @@ def get_opt(model):
     torch.nn.init.uniform_ = skip
     torch.nn.init.normal_ = skip
     from transformers import AutoModelForCausalLM
-    model = AutoModelForCausalLM.from_pretrained(model, torch_dtype=torch.bfloat16, attn_implementation = "flash_attention_2")
+    model = AutoModelForCausalLM.from_pretrained(model, torch_dtype=torch.float32)
     print("ms", model.config.max_position_embeddings)
     model.seqlen = model.config.max_position_embeddings
     return model
@@ -562,8 +562,8 @@ def opt_sequential(model, dataloader, dev, target_bits=2.0, n_samples=256, norm_
                     p.requires_grad = True
 
                 print("tuning weights: ", n_samples, to_opt.keys(), [v.dtype for v in to_opt.values()])
-#                opt = torch.optim.AdamW(to_opt.values(), lr, weight_decay=weight_decay)
-                opt = BF16FusedAdamW(to_opt.values(), lr, weight_decay=weight_decay)
+                opt = torch.optim.AdamW(to_opt.values(), lr, weight_decay=weight_decay)
+#                opt = BF16FusedAdamW(to_opt.values(), lr, weight_decay=weight_decay)
                 if one_cycle_lr:
                     sch = torch.optim.lr_scheduler.OneCycleLR(opt, lr, total_steps=n_samples*n_epochs // n_grad_accumu, cycle_momentum=False)
                 else:

@@ -158,7 +158,7 @@ if args.is_save_ckpt:
     for n, m in model.named_modules():
         if type(m) == BitLinear and "lm_head" not in n:
             m.pack_to_save()
-    torch.save(model.state_dict(), os.path.join(args.save_dir, f"model_saved_as_state_dict.pth"))
+#    torch.save(model.state_dict(), os.path.join(args.save_dir, f"model_saved_as_state_dict.pth"))
     print(f"Model's save dict has been saved!")
 
 
